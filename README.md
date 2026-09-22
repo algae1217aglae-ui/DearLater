@@ -40,6 +40,11 @@ npm.cmd start
 
 Set `DEAR_LATER_DATA` to move the JSON file. The default is `data/letters.json` inside the project.
 
+Two more variables control who the server answers:
+
+- `DEAR_LATER_ORIGINS`: comma-separated browser origins (for example `https://letters.example`) allowed to call the API from a web page. Pages served from `localhost`, `127.0.0.1`, or `[::1]` on any port are always allowed. Every other origin gets `403`.
+- `DEAR_LATER_HOSTS`: comma-separated hostnames the server accepts in the `Host` header. `localhost`, `127.0.0.1`, and `[::1]` are always accepted. Anything else gets `421`. Set this when you put the service behind a reverse proxy with its own name.
+
 ## API
 
 All API responses use JSON and `Cache-Control: no-store`.
@@ -82,9 +87,11 @@ Content-Type: application/json
 }
 ```
 
-Use either `date` in local `YYYY-MM-DD` form or an integer `days` from 1 to 1095. The date must be tomorrow or later and within three years. Letter text is limited to 20,000 Unicode characters. Request bodies are limited to 64 KiB.
+Use either `date` in local `YYYY-MM-DD` form or an integer `days` from 1 to 1095. The date must be tomorrow or later and within three years. Letter text is limited to 20,000 Unicode characters. Request bodies are limited to 64 KiB and must be sent as `application/json` (anything else gets `415`). The box holds at most 5,000 letters (`507` when full; adjust with `maxLetters` when embedding the store).
 
-Colors must be six-digit hex values. Invalid colors fall back to neutral defaults. SVG artwork is limited to 80 KB and is stripped of scripts, event handlers, external references, embedded images, links, styles, and foreign objects. Treat the sanitizer as a narrow decoration filter, not as a general-purpose HTML sanitizer.
+Colors must be six-digit hex values. Invalid colors fall back to neutral defaults.
+
+SVG artwork is limited to 80 KB and is rebuilt from an allowlist rather than filtered with a blocklist. Only these elements survive: `svg`, `g`, `path`, `circle`, `ellipse`, `rect`, `line`, `polyline`, `polygon`. Only plain geometry and paint attributes survive (`d`, `points`, `viewBox`, `width`, `height`, `x`, `y`, `cx`, `cy`, `r`, `fill`, `stroke`, `stroke-width`, `opacity`, `transform`, and a few siblings), and their values may contain only letters, digits, whitespace, and `. , # % ( ) + -`. Everything else is dropped: text, comments, processing instructions, unknown elements, unknown attributes, and any value carrying a URL, entity, quote, or colon. The output is generated from scratch, so no byte of the input is copied through unchanged. Gradients, patterns, text, images, and styles are therefore not supported on envelopes.
 
 ### Delete a letter
 
@@ -125,7 +132,7 @@ if (!response.ok) {
 
 `src/drand-lock.mjs` asks the drand mainnet client for chain information, converts the opening time to a future round, and encrypts the UTF-8 letter for that round. The secret needed to decrypt becomes publicly derivable only after the drand network publishes that round.
 
-The server checks for due letters once a minute and whenever `GET /api/letters` is called. Successful decryption replaces `cipher` and `round` in the data file with `text` and `unlockedAt`.
+The server checks for due letters once a minute and whenever `GET /api/letters` is called. Successful decryption replaces `cipher` and `round` in the data file with `text` and `unlockedAt`. When decryption fails (drand unreachable, for example), the letter is retried with exponential backoff starting at one minute and capped at six hours, so a stuck letter does not slow down every listing.
 
 ## Security boundary
 
@@ -137,6 +144,7 @@ Dear Later is a single-user, self-hosted service. It is not multi-user end-to-en
 - After the opening time, plaintext is persisted so clients can read it.
 - The API never returns ciphertext, but whoever controls the server or data file can modify the software or copy stored data.
 - The API has no authentication. It binds to localhost by default; if you expose it, put authentication and TLS in front of it.
+- Binding to localhost keeps other machines out but not other web pages open in the same browser. The server therefore rejects requests whose `Host` header does not name this machine (DNS rebinding) and requests whose `Origin` is neither local nor listed in `DEAR_LATER_ORIGINS` (cross-site pages). Allowed origins receive normal CORS headers and preflight answers.
 - Pre-opening confidentiality depends on the drand network, `tlock-js`, the selected cryptography, and the host not retaining plaintext elsewhere.
 - Availability depends on network access to drand. A temporary drand or network failure delays opening; it does not erase the ciphertext.
 
@@ -156,8 +164,11 @@ import { fileURLToPath } from 'node:url';
 const store = createLetterStore({
   filePath: fileURLToPath(new URL('./data/letters.json', import.meta.url)),
   locker: createDrandLocker(),
+  maxLetters: 5000,
 });
 ```
+
+`createDearLaterServer({ store, allowedOrigins, allowedHosts })` takes the same lists the environment variables provide.
 
 ## Tests
 

@@ -1,13 +1,28 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import http from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+
+// fetch silently drops a caller-supplied Host header, so a DNS-rebinding shaped
+// request has to be sent with the raw http client.
+function statusWithHost(base, host) {
+  const { hostname, port } = new URL(base);
+  return new Promise((resolve, reject) => {
+    const request = http.request(
+      { host: hostname, port, path: '/api/health', method: 'GET', setHost: false, headers: { host } },
+      response => { response.resume(); response.on('end', () => resolve(response.statusCode)); },
+    );
+    request.on('error', reject);
+    request.end();
+  });
+}
 
 import { createLetterStore } from '../src/letters.mjs';
 import { createDearLaterServer } from '../server.mjs';
 
-async function harness({ withPublicDir = false } = {}) {
+async function harness({ withPublicDir = false, allowedOrigins, allowedHosts } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'dearlater-server-'));
   const publicDir = join(dir, 'public');
   if (withPublicDir) {
@@ -21,7 +36,12 @@ async function harness({ withPublicDir = false } = {}) {
     async unlock(cipher) { return cipher.replace(/^secret:/, ''); },
   };
   const store = createLetterStore({ filePath: join(dir, 'letters.json'), locker });
-  const server = createDearLaterServer({ store, ...(withPublicDir ? { publicDir } : {}) });
+  const server = createDearLaterServer({
+    store,
+    allowedOrigins,
+    allowedHosts,
+    ...(withPublicDir ? { publicDir } : {}),
+  });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const address = server.address();
   const base = `http://127.0.0.1:${address.port}`;
@@ -137,4 +157,83 @@ test('rejects request bodies larger than the configured limit', async t => {
     body: JSON.stringify({ text: 'x'.repeat(70_000), days: 3 }),
   });
   assert.equal(response.status, 413);
+});
+
+test('refuses request shapes a foreign web page could send: wrong content type, foreign origin, foreign host', async t => {
+  const h = await harness();
+  t.after(() => h.close());
+  const body = JSON.stringify({ text: 'planted', days: 3 });
+
+  const simpleRequest = await fetch(h.base + '/api/letters', {
+    method: 'POST',
+    headers: { 'content-type': 'text/plain', origin: 'https://other.example' },
+    body,
+  });
+  assert.equal(simpleRequest.status, 403);
+
+  const wrongType = await fetch(h.base + '/api/letters', {
+    method: 'POST',
+    headers: { 'content-type': 'text/plain' },
+    body,
+  });
+  assert.equal(wrongType.status, 415);
+
+  const foreignOrigin = await fetch(h.base + '/api/letters', { headers: { origin: 'https://other.example' } });
+  assert.equal(foreignOrigin.status, 403);
+  assert.equal(foreignOrigin.headers.get('access-control-allow-origin'), null);
+
+  const opaqueOrigin = await fetch(h.base + '/api/letters', { headers: { origin: 'null' } });
+  assert.equal(opaqueOrigin.status, 403);
+
+  assert.equal(await statusWithHost(h.base, 'other.example'), 421);
+  assert.equal(await statusWithHost(h.base, 'localhost:9'), 200);
+
+  assert.equal((await h.json('/api/letters')).payload.letters.length, 0, 'nothing was planted');
+});
+
+test('answers local and allowlisted origins with CORS headers and preflight', async t => {
+  const h = await harness({ allowedOrigins: ['https://letters.example'] });
+  t.after(() => h.close());
+
+  const local = await fetch(h.base + '/api/health', { headers: { origin: 'http://localhost:5173' } });
+  assert.equal(local.status, 200);
+  assert.equal(local.headers.get('access-control-allow-origin'), 'http://localhost:5173');
+
+  const listed = await fetch(h.base + '/api/health', { headers: { origin: 'https://letters.example' } });
+  assert.equal(listed.headers.get('access-control-allow-origin'), 'https://letters.example');
+
+  const preflight = await fetch(h.base + '/api/letters', {
+    method: 'OPTIONS',
+    headers: { origin: 'https://letters.example', 'access-control-request-method': 'POST' },
+  });
+  assert.equal(preflight.status, 204);
+  assert.match(preflight.headers.get('access-control-allow-methods'), /POST/);
+  assert.match(preflight.headers.get('access-control-allow-headers'), /content-type/i);
+
+  const foreignPreflight = await fetch(h.base + '/api/letters', {
+    method: 'OPTIONS',
+    headers: { origin: 'https://other.example', 'access-control-request-method': 'POST' },
+  });
+  assert.equal(foreignPreflight.status, 403);
+
+  const hosted = await harness({ allowedHosts: ['letters.example'] });
+  t.after(() => hosted.close());
+  assert.equal(await statusWithHost(hosted.base, 'letters.example'), 200);
+  assert.equal(await statusWithHost(hosted.base, 'other.example'), 421);
+});
+
+test('malformed ids and bodies are client errors without internal details', async t => {
+  const h = await harness();
+  t.after(() => h.close());
+
+  const badId = await h.json('/api/letters/%E0%A4%A', { method: 'DELETE' });
+  assert.equal(badId.response.status, 400);
+
+  const nullBody = await h.json('/api/letters', { method: 'POST', body: 'null' });
+  assert.equal(nullBody.response.status, 400);
+  assert.match(nullBody.payload.error, /JSON object/i);
+  assert.doesNotMatch(nullBody.payload.error, /destructure|intermediate value/i);
+
+  const arrayBody = await h.json('/api/letters', { method: 'POST', body: '[1,2]' });
+  assert.equal(arrayBody.response.status, 400);
 });
