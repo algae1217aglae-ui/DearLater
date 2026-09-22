@@ -1,0 +1,17 @@
+{
+  "name": "dearlater",
+  "version": "0.1.0",
+  "description": "A headless, self-hosted API for letters that stay encrypted until a future drand round.",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "tlock-js": "^0.9.0"
+  },
+  "license": "MIT"
+}
